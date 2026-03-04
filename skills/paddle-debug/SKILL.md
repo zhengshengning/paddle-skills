@@ -79,7 +79,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 [日志片段、对比结果、重要观测点输出]
 ```
 
-报告存放在 `.paddle-agent/debug-analysis/` 目录。
+报告存放在 `.paddle-agent/debug-analysis/` 目录，没有该目录请创建。
 
 归因时考虑以下维度：
 - **接口 / 形状 / dtype**：哪个 Tensor 的 shape / dtype 与预期不符
@@ -91,7 +91,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 - 先用最小复现脚本验证修复
 - 再用完整训练 / 推理脚本验证关键业务路径
 
-## 步骤 4：利用 Git / CI 收束和巩固结论
+## 步骤 4：利用 Git / CI 收束和巩固结论，最后总结保存为文件
 
 当判断问题可能由近期提交引入时：
 - 使用 `git bisect` 对可疑提交范围做二分定位
@@ -115,12 +115,42 @@ FLAGS_check_cuda_error=1 FLAGS_use_system_allocator=1 python reproduce.py
 - CUDA 错误通常是异步的，使用 `FLAGS_check_cuda_error=1` 让错误立即暴露
 - GPU kernel 调用前必须检查 numel/shape 是否为空
 - 空 Tensor（numel=0）会导致 grid size=0，触发 CUDA error(9)
+- CUDA API 返回值必须全部检查，忽略返回值会导致 sticky error 残留
+- `PADDLE_ENFORCE_GPU_SUCCESS` 不会调用 `cudaGetLastError()`，在错误路径上需手动清除
 
 ## 注意事项
 
 - 调试的第一目标是**稳定复现并缩小范围**，不要一开始就尝试大规模重构
 - 任何「只在某些机器上出现」的问题，优先从环境差异入手
 - 在 Paddle 仓库遇到 bug 时，优先按本 skill 流程执行，再考虑具体修复实现
+
+### 算子修复注意事项
+
+- **前向和反向 kernel 要一并检查**：反向 kernel 往往复用相同的计算逻辑，同样存在边界问题
+- **检查所有入口函数**：底层公共函数可能被多个入口调用，确保边界检查在正确的层级
+- **头文件修改需完整重编**：修改 `.h` 后需重新编译所有引用它的 `.cu`，并重新链接 `.so`
+
+### CUDA API 与 Sticky Error 注意事项
+
+- **所有 CUDA API 返回值必须检查**：包括 `cudaEventSynchronize`、`cudaStreamSynchronize` 等，忽略返回值不仅丢失错误信息，还会导致 CUDA runtime 中残留 sticky error
+- **错误路径必须清除 last error**：在 `PADDLE_ENFORCE_GPU_SUCCESS` 抛出异常之前，手动调用 `cudaGetLastError()` 清除残留错误，否则 Python `try/except` 捕获异常后 CUDA 状态仍被污染
+- **跨测试状态污染**：unittest 中一个测试的 CUDA sticky error 会影响后续所有测试，排查时需关注测试执行顺序
+- **定位 sticky error 污染源**：通过逐步删减测试来二分定位产生残留错误的源头测试
+
+### Paddle 编译验证流程
+
+修改 kernel 头文件后的增量编译：
+```bash
+cd build
+# 编译修改的 kernel
+ninja paddle/phi/CMakeFiles/phi_gpu.dir/kernels/gpu/<kernel_name>.cu.o -j512
+# 重新链接 phi_gpu
+ninja phi_gpu -j512
+# 重新链接 libpaddle.so
+ninja paddle/fluid/pybind/libpaddle.so -j512
+# 如果 Python 库未自动更新，手动复制
+cp paddle/fluid/pybind/libpaddle.so python/paddle/base/libpaddle.so
+```
 
 ## 调试案例
 
