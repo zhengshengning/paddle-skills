@@ -17,9 +17,12 @@
 |--------|------|----------|
 | `CUDA error(1)` | cudaErrorInvalidValue | 非法参数值，如空指针、越界 |
 | `CUDA error(2)` | cudaErrorMemoryAllocation | 显存分配失败，OOM |
+| `CUDA error(3)` | cudaErrorInitializationError | CUDA 初始化失败，常见于 fork 后的子进程中（CUDA context 不可用） |
 | `CUDA error(4)` | cudaErrorLaunchFailure | kernel 启动失败 |
 | `CUDA error(9)` | cudaErrorInvalidConfiguration | kernel 配置无效（grid/block size 为 0 或超限） |
 | `CUDA error(11)` | cudaErrorInvalidValue | 非法设备指针或参数 |
+| `CUDA error(35)` | cudaErrorInsufficientDriver | CUDA driver 版本不足或异常 |
+| `CUDA error(100)` | cudaErrorNoDevice | 无可用 GPU 设备 |
 | `CUDA error(400)` | cudaErrorInvalidResourceHandle | 无效的 CUDA 资源句柄（stream/event 未初始化或已销毁） |
 | `CUDA error(700)` | cudaErrorIllegalAddress | 非法内存访问 |
 | `CUDA error(719)` | cudaErrorLaunchFailure | kernel 执行期间出错 |
@@ -110,3 +113,81 @@ if (err != cudaSuccess) {
    err = libcudart.cudaGetLastError()
    print(f"CUDA last error: {err}")  # 0 表示无错误
    ```
+
+## CUDA Fork Safety（进程 fork 与 CUDA 的冲突）
+
+### 背景
+
+CUDA runtime 的 context（包括 GPU 内存句柄、stream、event 等）**在 `fork()` 后不可用**。这是 NVIDIA CUDA 的设计约束：fork 出的子进程继承了父进程的虚拟地址空间，但 CUDA driver 内部状态在子进程中是无效的。
+
+任何在 fork 后的子进程中调用 CUDA API（如 `cudaGetDevice`、`cudaFree`、`cudaSetDevice`）都会返回 `cudaErrorInitializationError`(3)。
+
+### 典型触发场景
+
+```
+主进程: 初始化 CUDA (创建 GPU tensor / 运行 GPU 测试)
+  |
+  |-- fork --> DataLoader worker 子进程
+                |
+                |-- 继承了父进程中 GPU tensor 的 shared_ptr
+                |-- GC 回收时触发 DenseTensor::~DenseTensor()
+                |-- 析构链调用 cudaFree / cudaGetDevice
+                |-- CUDA error(3)! ABORT!
+```
+
+**关键条件组合**（三个条件同时满足才触发）：
+1. 父进程已初始化 CUDA（任何 GPU 操作都算）
+2. 使用了 `fork` 方式创建子进程（如 `DataLoader(num_workers>0)`）
+3. 子进程中触发了 GPU 内存释放（继承的 GPU tensor 被 GC 回收）
+
+### Paddle 中的具体调用链
+
+```
+DenseTensor::~DenseTensor()
+  -> ~shared_ptr<phi::Allocation>()
+    -> AllocationDeleter()
+      -> CUDAAllocator::FreeImpl()
+        -> RecordedGpuFree()
+          -> RecordedGpuMallocHelper::Free()
+            -> CUDADeviceGuard(dev_id_)
+              -> GetCurrentDeviceId()
+                -> cudaGetDevice()  <-- error 3!
+```
+
+### Paddle 中的内存分配器路径
+
+不同 FLAGS 配置下，GPU 内存释放走不同路径：
+
+| 配置 | 分配器链 | Free 路径 |
+|------|---------|-----------|
+| 默认 | StatAllocator -> RetryAllocator -> StreamSafeCUDA -> AutoGrowth -> CUDAAllocator | 缓存池管理，不立即 cudaFree |
+| `FLAGS_use_system_allocator=1` | CUDAAllocator (直接) | 每次都调用 cudaFree |
+
+`FLAGS_use_system_allocator=1` 下更容易触发此问题，因为每个 tensor 释放都直接走 `cudaFree`。
+
+### 修复模式
+
+在调用 CUDA API 前先做 context 可用性检查：
+
+```cpp
+// 在 cudaFree / CUDADeviceGuard 之前添加
+{
+  int device_id;
+  auto err = cudaGetDevice(&device_id);
+  if (err == cudaErrorInitializationError ||  // fork 后
+      err == cudaErrorNoDevice ||             // 无 GPU
+      err == cudaErrorInsufficientDriver) {   // driver 异常
+    cudaGetLastError();  // 清除 sticky error
+    return;              // 跳过释放，由 OS 回收
+  }
+}
+```
+
+跳过 `cudaFree` 是安全的：fork 后子进程中的 GPU 内存不属于该进程，进程退出时 OS/driver 自动回收。
+
+### 排查要点
+
+1. **确认是否为 fork 问题**：检查错误是否发生在子进程（DataLoader worker）中，且父进程之前有 GPU 操作
+2. **单独运行不复现**：fork safety 问题通常只在多测试/多进程场景下出现——单独运行某个测试通过，全部一起跑才失败
+3. **穷举 CUDA API 调用路径**：修复时要覆盖所有可能的 CUDA API 调用点（`Free`、`FreeAsync` 等），不能只修一处
+4. **验证 .so 实际加载**：确保 Python 加载的 `.so` 是重新编译后的版本（行号对比法——如果错误消息中的行号和修改后的源码行号不一致，说明加载了旧 `.so`）

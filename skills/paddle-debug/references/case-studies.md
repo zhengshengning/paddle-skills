@@ -182,3 +182,73 @@ float CudaEvent::ElapsedTime(CudaEvent *end_event) {
 3. **`FLAGS_check_cuda_error=1` 的放大效应**：该 flag 使每个算子前后都调用 `cudaDeviceSynchronize()` + `cudaGetLastError()`，能检测到之前任何残留的错误——即使错误发生在完全不相关的代码路径上
 4. **跨测试状态污染**：unittest 中一个测试产生的 CUDA sticky error 可以影响后续所有测试，问题表现为"看似无关的测试随机失败"
 5. **最小复现的缩减策略**：对于仅在特定测试序列下出现的 bug，应关注测试执行顺序、逐个删除测试来二分定位"污染源"测试
+
+---
+
+## 案例：RecordedGpuMallocHelper::Free CUDA error(3) fork safety 修复
+
+### 问题描述
+```bash
+FLAGS_check_cuda_error=1 FLAGS_use_system_allocator=1 python test/legacy_test/test_newprofiler.py
+```
+`TestTimerOnly::test_with_dataloader` 失败，DataLoader worker 子进程报错：`CUDA error(3), initialization error`，随后 abort。
+
+### 关键现象
+
+- **全部测试一起跑才出现**：单独运行 `test_with_dataloader` 通过
+- **需要 `FLAGS_use_system_allocator=1`**：默认分配器下不触发（因为有缓存池，不会立即 `cudaFree`）
+- **错误发生在 DataLoader worker 子进程中**（fork 出来的进程）
+
+### 根因分析
+
+**触发链**：
+1. `TestProfiler::test_profiler` 在主进程中初始化了 CUDA（创建了 GPU tensor）
+2. `TestTimerOnly::test_with_dataloader` 使用 `DataLoader(num_workers=2)` fork 子进程
+3. 子进程继承了父进程中 GPU tensor 的 `shared_ptr<Allocation>` 引用
+4. 子进程中 GC 回收 tensor 时，触发 `DenseTensor::~DenseTensor()`
+5. 析构链：`CUDAAllocator::FreeImpl` -> `RecordedGpuFree` -> `RecordedGpuMallocHelper::Free`
+6. `Free` 方法构造 `CUDADeviceGuard(dev_id_)` -> `GetCurrentDeviceId()` -> `cudaGetDevice()`
+7. fork 后子进程中 CUDA context 不可用，`cudaGetDevice()` 返回 error 3
+8. `PADDLE_ENFORCE_GPU_SUCCESS` 将此视为致命错误并 abort
+
+**代码位置**：
+- 崩溃点：`paddle/phi/backends/gpu/cuda/cuda_info.cc:179` — `GetCurrentDeviceId()` 中的 `PADDLE_ENFORCE_GPU_SUCCESS(cudaGetDevice(&device_id))`
+- 问题入口：`paddle/phi/core/platform/device/gpu/gpu_info.cc:338` — `RecordedGpuMallocHelper::Free()` 中的 `CUDADeviceGuard guard(dev_id_)`
+
+### 修复方案
+
+在 `RecordedGpuMallocHelper::Free()` 和 `FreeAsync()` 中，在 `CUDADeviceGuard` 之前添加 CUDA context 可用性检查：
+
+```cpp
+{
+  int device_id;
+  auto device_err = cudaGetDevice(&device_id);
+  if (device_err == cudaErrorInitializationError ||
+      device_err == cudaErrorNoDevice ||
+      device_err == cudaErrorInsufficientDriver) {
+    cudaGetLastError();  // 清除 sticky error
+    return;              // 跳过释放，由 OS/driver 回收
+  }
+}
+CUDADeviceGuard guard(dev_id_);  // 现在安全了
+```
+
+### 修复文件
+
+- `paddle/phi/core/platform/device/gpu/gpu_info.cc`（`RecordedGpuMallocHelper::Free` 和 `FreeAsync`）
+
+### 调试过程中的关键踩坑点
+
+| 踩坑点 | 说明 | 解决方法 |
+|--------|------|---------|
+| .so 未同步 | `ninja phi_gpu` 编译了新 `.so`，但 Python 加载的 `build/python/paddle/libs/libphi_core.so` 是旧版本 | 手动 `cp build/paddle/phi/libphi_core.so build/python/paddle/libs/` |
+| 行号不变判断法 | 修改代码后错误消息中行号没变（仍显示 :179），暴露了旧 `.so` 问题 | 利用行号作为判断 .so 是否更新的 indicator |
+| 调用链穷举 | `GetCurrentDeviceId` 被多处调用，需要确认实际触发路径 | 在崩溃函数中加 `backtrace_symbols_fd` 临时日志 |
+
+### 经验总结
+
+1. **"单独通过，一起失败"的 bug 优先检查跨测试副作用**：前一个测试初始化了 CUDA context，后一个测试 fork 了子进程，两者组合导致问题
+2. **CUDA fork safety 是底层框架必须处理的边界条件**：任何可能在 fork 后子进程中调用的 CUDA API，都需要做 context 可用性检查
+3. **`FLAGS_use_system_allocator=1` 绕过了缓存池**：使问题在正常路径下隐藏的 bug 暴露出来（默认分配器有缓存，不会每次都 `cudaFree`）
+4. **增量编译后必须验证 .so 部署**：Paddle 的构建产物和 Python 加载路径不同，`ninja` 只更新了前者，需要手动同步后者
+5. **修复必须覆盖所有并行路径**：`Free` 和 `FreeAsync` 都需要添加保护，不能只修一处
