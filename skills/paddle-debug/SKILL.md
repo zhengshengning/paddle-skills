@@ -7,6 +7,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 
 ## 调试流程概览
 
+
 调试遵循以下步骤：
 
 1. 描述问题并构造最小复现
@@ -79,7 +80,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 [日志片段、对比结果、重要观测点输出]
 ```
 
-报告存放在 `.paddle-agent/debug-analysis/` 目录。
+报告存放在 `.paddle-agent/debug-analysis/` 目录，没有该目录请创建。
 
 归因时考虑以下维度：
 - **接口 / 形状 / dtype**：哪个 Tensor 的 shape / dtype 与预期不符
@@ -91,7 +92,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 - 先用最小复现脚本验证修复
 - 再用完整训练 / 推理脚本验证关键业务路径
 
-## 步骤 4：利用 Git / CI 收束和巩固结论
+## 步骤 4：利用 Git / CI 收束和巩固结论，最后总结保存为文件
 
 当判断问题可能由近期提交引入时：
 - 使用 `git bisect` 对可疑提交范围做二分定位
@@ -108,6 +109,7 @@ description: 在 Paddle 代码库中定位问题并输出高质量调试报告�
 快速参考：
 ```bash
 # 启用错误检查环境变量复现问题
+export PYTHONPATH=$(pwd)/Paddle/build/python
 FLAGS_check_cuda_error=1 FLAGS_use_system_allocator=1 python reproduce.py
 ```
 
@@ -115,12 +117,87 @@ FLAGS_check_cuda_error=1 FLAGS_use_system_allocator=1 python reproduce.py
 - CUDA 错误通常是异步的，使用 `FLAGS_check_cuda_error=1` 让错误立即暴露
 - GPU kernel 调用前必须检查 numel/shape 是否为空
 - 空 Tensor（numel=0）会导致 grid size=0，触发 CUDA error(9)
+- CUDA API 返回值必须全部检查，忽略返回值会导致 sticky error 残留
+- `PADDLE_ENFORCE_GPU_SUCCESS` 不会调用 `cudaGetLastError()`，在错误路径上需手动清除
+- **CUDA context 在 fork 后不可用**：父进程初始化了 CUDA 后 fork 子进程（如 DataLoader worker），子进程中所有 CUDA API 调用都会返回 `cudaErrorInitializationError`(3)——详见 [references/cuda-debug.md](references/cuda-debug.md) 中的 **CUDA Fork Safety** 章节
 
 ## 注意事项
 
 - 调试的第一目标是**稳定复现并缩小范围**，不要一开始就尝试大规模重构
 - 任何「只在某些机器上出现」的问题，优先从环境差异入手
 - 在 Paddle 仓库遇到 bug 时，优先按本 skill 流程执行，再考虑具体修复实现
+
+### 算子修复注意事项
+
+- **前向和反向 kernel 要一并检查**：反向 kernel 往往复用相同的计算逻辑，同样存在边界问题
+- **检查所有入口函数**：底层公共函数可能被多个入口调用，确保边界检查在正确的层级
+- **头文件修改需完整重编**：修改 `.h` 后需重新编译所有引用它的 `.cu`，并重新链接 `.so`
+
+### CUDA API 与 Sticky Error 注意事项
+
+- **所有 CUDA API 返回值必须检查**：包括 `cudaEventSynchronize`、`cudaStreamSynchronize` 等，忽略返回值不仅丢失错误信息，还会导致 CUDA runtime 中残留 sticky error
+- **错误路径必须清除 last error**：在 `PADDLE_ENFORCE_GPU_SUCCESS` 抛出异常之前，手动调用 `cudaGetLastError()` 清除残留错误，否则 Python `try/except` 捕获异常后 CUDA 状态仍被污染
+- **跨测试状态污染**：unittest 中一个测试的 CUDA sticky error 会影响后续所有测试，排查时需关注测试执行顺序
+- **定位 sticky error 污染源**：通过逐步删减测试来二分定位产生残留错误的源头测试
+
+### CUDA Fork Safety 注意事项
+
+- **CUDA context 在 fork 后不可用**：如果父进程已初始化 CUDA（创建了 GPU tensor、调用过 CUDA API），fork 出的子进程中所有 CUDA 调用都会返回 `cudaErrorInitializationError`(3)
+- **典型触发场景**：主进程中运行了 GPU 测试/训练后，DataLoader 使用 `num_workers > 0` fork 子进程；子进程继承了父进程中 GPU tensor 的引用，GC 回收时触发 `cudaFree`
+- **修复模式**：在 CUDA API 调用前检测 context 是否可用，对 fork 后不可用的场景做 graceful skip
+- **判断依据**：`cudaGetDevice()` 返回 `cudaErrorInitializationError`(3)、`cudaErrorNoDevice`(100)、`cudaErrorInsufficientDriver`(35) 均表示 CUDA 不可用
+- **安全性**：跳过 `cudaFree` 是安全的，因为 fork 后子进程中的 GPU 内存不属于该进程，进程退出时由 OS/driver 回收
+
+### Paddle 编译验证流程
+
+修改 kernel 头文件后的增量编译：
+```bash
+cd build
+# 编译修改的 kernel
+ninja paddle/phi/CMakeFiles/phi_gpu.dir/kernels/gpu/<kernel_name>.cu.o -j512
+# 重新链接 phi_gpu
+ninja phi_gpu -j512
+# 重新链接 libpaddle.so
+ninja paddle/fluid/pybind/libpaddle.so -j512
+# 如果 Python 库未自动更新，手动复制
+cp paddle/fluid/pybind/libpaddle.so python/paddle/base/libpaddle.so
+```
+
+### .so 部署验证（关键踩坑点）
+
+Paddle 构建产物存在两套路径，增量编译后 Python 加载的可能仍是旧版本：
+
+| 构建产物路径 | Python 加载路径 | 说明 |
+|---|---|---|
+| `build/paddle/phi/libphi_core.so` | `build/python/paddle/libs/libphi_core.so` | phi core 库 |
+| `build/paddle/phi/libphi_gpu.so` | `build/python/paddle/libs/libphi_gpu.so` | phi GPU 库 |
+| `build/paddle/fluid/pybind/libpaddle.so` | `build/python/paddle/base/libpaddle.so` | 主绑定库 |
+
+**增量编译后务必检查**：
+```bash
+# 确认 Python 实际加载了哪个 .so
+python -c "import paddle; import os; print(os.path.realpath(paddle.__file__))"
+
+# 比较构建时间戳
+stat build/paddle/phi/libphi_core.so
+stat build/python/paddle/libs/libphi_core.so
+
+# 如果时间戳不一致，手动同步
+cp build/paddle/phi/libphi_core.so build/python/paddle/libs/libphi_core.so
+cp build/paddle/phi/libphi_gpu.so build/python/paddle/libs/libphi_gpu.so
+```
+
+**典型症状**：修改了源码并重新编译，但运行时错误信息中的**行号不变**——这说明 Python 加载的仍是旧 `.so`。
+
+### 多路径调用链分析方法
+
+当崩溃发生在公共底层函数（如 `GetCurrentDeviceId`、`cudaFree`）时，需穷举所有调用路径来定位真正的入口：
+
+1. **从崩溃点出发，向上追溯**：用 Grep 搜索崩溃函数的所有调用者，逐层向上展开
+2. **结合分配器类型缩小范围**：根据 FLAGS（如 `FLAGS_use_system_allocator`）确定实际使用的分配器链路
+3. **Tensor 生命周期追踪**：`DenseTensor::~DenseTensor` -> `shared_ptr<Allocation>` -> `AllocationDeleter` -> 具体分配器的 `FreeImpl`
+4. **在崩溃点添加 backtrace 日志**：临时加入 `backtrace_symbols_fd` 打印调用栈，确认实际触发路径
+5. **注意虚函数/宏展开**：`PADDLE_ENFORCE_GPU_SUCCESS` 是宏，行号由 `__LINE__` 决定；`FreeImpl` 是虚函数，实际调用取决于运行时类型
 
 ## 调试案例
 
